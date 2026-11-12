@@ -1,14 +1,14 @@
 """脚本策略引擎。"""
 import sys
-import importlib
+import inspect
+import runpy
 import traceback
-from types import ModuleType
 from typing import Any, cast
 from collections.abc import Callable
 from collections.abc import Sequence
 from pathlib import Path
 from datetime import datetime
-from threading import Thread
+from threading import RLock, Thread, current_thread
 
 from pandas import DataFrame
 
@@ -48,6 +48,9 @@ class ScriptEngine(BaseEngine):
 
         self.strategy_active: bool = False
         self.strategy_thread: Thread | None = None
+        self.strategy_status: str = "idle"
+        self.strategy_error: str = ""
+        self._strategy_lock: RLock = RLock()
 
         self.datafeed: BaseDatafeed = get_datafeed()
 
@@ -62,43 +65,74 @@ class ScriptEngine(BaseEngine):
 
     def start_strategy(self, script_path: str) -> None:
         """运行策略线程中的策略方法"""
-        if self.strategy_active:
-            return
-        self.strategy_active = True
-
-        self.strategy_thread = Thread(
-            target=self.run_strategy, args=(script_path,))
-        self.strategy_thread.start()
-
-        self.write_log("策略交易脚本启动")
+        with self._strategy_lock:
+            if self.strategy_thread and self.strategy_thread.is_alive():
+                raise RuntimeError("已有脚本正在运行或停止中")
+            self.strategy_active = True
+            self.strategy_status = "running"
+            self.strategy_error = ""
+            self.strategy_thread = Thread(
+                target=self.run_strategy, args=(script_path,))
+            try:
+                self.strategy_thread.start()
+            except RuntimeError as exc:
+                self.strategy_active = False
+                self.strategy_status = "failed"
+                self.strategy_error = f"策略交易脚本启动失败：{exc}"
+                self.strategy_thread = None
+                self.write_log(self.strategy_error)
+                raise
+            self.write_log("策略交易脚本启动")
 
     def run_strategy(self, script_path: str) -> None:
         """加载策略脚本并调用run函数"""
-        path: Path = Path(script_path)
-        sys.path.append(str(path.parent))
-
-        script_name: str = path.parts[-1]
-        module_name: str = script_name.replace(".py", "")
-
+        path: Path = Path(script_path).resolve()
+        if str(path.parent) not in sys.path:
+            sys.path.append(str(path.parent))
         try:
-            module: ModuleType = importlib.import_module(module_name)
-            importlib.reload(module)
-            module.run(self)
-        except Exception:
+            namespace = runpy.run_path(str(path))
+            run = namespace.get("run")
+            if not callable(run) or inspect.iscoroutinefunction(run):
+                raise TypeError("脚本必须定义同步函数 run(engine)")
+            inspect.signature(run).bind(self)
+            run(self)
+        except (Exception, SystemExit):
             msg: str = f"触发异常已停止\n{traceback.format_exc()}"
+            with self._strategy_lock:
+                self.strategy_status = "failed"
+                self.strategy_error = msg
             self.write_log(msg)
+        finally:
+            with self._strategy_lock:
+                self.strategy_active = False
+                if self.strategy_status != "failed":
+                    self.strategy_status = "stopped" if self.strategy_status == "stopping" else "completed"
+                    self.write_log("策略交易脚本已停止" if self.strategy_status == "stopped" else "策略交易脚本执行完成")
 
-    def stop_strategy(self) -> None:
-        """停止运行中的策略"""
-        if not self.strategy_active:
+    def stop_strategy(self, timeout: float = 5.0) -> None:
+        """请求脚本协作停止，超时后保留线程状态并报告错误。"""
+        with self._strategy_lock:
+            thread = self.strategy_thread
+            self.strategy_active = False
+            if thread is None or not thread.is_alive():
+                self.strategy_thread = None
+                return
+            if self.strategy_status != "failed":
+                self.strategy_status = "stopping"
+
+        if thread is current_thread():
             return
-        self.strategy_active = False
+        thread.join(timeout)
+        if thread.is_alive():
+            message = "脚本停止超时，请在 run(engine) 中检查 engine.strategy_active 并及时退出"
+            self.write_log(message)
+            raise TimeoutError(message)
+        with self._strategy_lock:
+            if self.strategy_thread is thread:
+                self.strategy_thread = None
 
-        if self.strategy_thread:
-            self.strategy_thread.join()
-        self.strategy_thread = None
-
-        self.write_log("策略交易脚本停止")
+    def close(self) -> None:
+        self.stop_strategy()
 
     def connect_gateway(self, setting: dict, gateway_name: str) -> None:
         """按配置连接指定交易接口。"""
